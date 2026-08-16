@@ -11,8 +11,9 @@ import asyncio
 import json
 import os
 import google.generativeai as genai
+from tools import web_search
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
 _flash_lite = genai.GenerativeModel("gemini-3.5-flash-lite")
 
 PERSONALITY_PROMPT = """You are a witty, capable personal assistant in the vein of \
@@ -20,16 +21,48 @@ Jarvis/Edith -- calm, dry humor, competent, never fawning. Keep replies concise 
 unless the user is asking for something detailed. Narrate briefly when doing \
 multi-step work ("checking that now...") rather than going silent."""
 
+TOOL_PROMPT = """You have access to a web search tool. If you need current information \
+or facts you don't know, you MUST output ONLY a JSON object like this to call the tool:
+{"tool_call": "web_search", "query": "your search query here"}
+If you do this, you will receive the search results in the next prompt, and then you can answer."""
+
 ANTIGRAVITY_ACCOUNTS = [
     os.environ.get("ANTIGRAVITY_HOME_ACCOUNT_A"),
     os.environ.get("ANTIGRAVITY_HOME_ACCOUNT_B"),
 ]
 
+def _parse_tool_call(response_text: str) -> dict | None:
+    text = response_text.strip()
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            data = json.loads(text)
+            if data.get("tool_call") == "web_search" and "query" in data:
+                return data
+        except json.JSONDecodeError:
+            pass
+    return None
 
 async def call_flash_lite(prompt: str, system: str = PERSONALITY_PROMPT) -> str:
-    full_prompt = f"{system}\n\nUser: {prompt}"
+    full_system = f"{system}\n\n{TOOL_PROMPT}"
+    full_prompt = f"{full_system}\n\nUser: {prompt}"
+
     response = await asyncio.to_thread(_flash_lite.generate_content, full_prompt)
-    return response.text.strip()
+    response_text = response.text.strip()
+
+    tool_call = _parse_tool_call(response_text)
+    if tool_call:
+        query = tool_call["query"]
+        results = await asyncio.to_thread(web_search.perform_search, query)
+
+        followup_prompt = f"{prompt}\n\n[System: The web search tool returned these results for '{query}':\n"
+        followup_prompt += json.dumps(results, indent=2)
+        followup_prompt += "\nNow, please answer the user's request.]"
+
+        full_followup = f"{full_system}\n\nUser: {followup_prompt}"
+        response = await asyncio.to_thread(_flash_lite.generate_content, full_followup)
+        return response.text.strip()
+
+    return response_text
 
 
 async def _run_agy(prompt: str, home_dir: str, timeout: int = 120) -> tuple[bool, str]:
@@ -68,14 +101,30 @@ async def call_antigravity(prompt: str, system: str = PERSONALITY_PROMPT) -> str
     of quota (or agy isn't set up), falls back to Flash-Lite with a note --
     better a degraded answer than no answer.
     """
-    full_prompt = f"{system}\n\n{prompt}"
+    full_system = f"{system}\n\n{TOOL_PROMPT}"
+    full_prompt = f"{full_system}\n\n{prompt}"
 
     for home_dir in ANTIGRAVITY_ACCOUNTS:
         if not home_dir:
             continue
         success, output = await _run_agy(full_prompt, home_dir)
         if success:
-            return output
+            tool_call = _parse_tool_call(output)
+            if tool_call:
+                query = tool_call["query"]
+                results = await asyncio.to_thread(web_search.perform_search, query)
+
+                followup_prompt = f"{prompt}\n\n[System: The web search tool returned these results for '{query}':\n"
+                followup_prompt += json.dumps(results, indent=2)
+                followup_prompt += "\nNow, please answer the user's request.]"
+                full_followup = f"{full_system}\n\n{followup_prompt}"
+
+                success_followup, output_followup = await _run_agy(full_followup, home_dir)
+                if success_followup:
+                    return output_followup
+            else:
+                return output
+
         is_quota_error = "quota" in output.lower() or "rate limit" in output.lower()
         if not is_quota_error:
             # A real error (auth, crash, etc) -- don't silently burn the other account too.
